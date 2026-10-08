@@ -390,6 +390,17 @@ handle_new_xdg_popup(struct wl_listener *listener, void *data)
 
 	popup->xdg_popup = wlr_popup;
 
+	/* Create the scene tree before connecting the listeners. Listeners run in
+	 * the order they were added, so the scene's own commit listener then runs
+	 * before ours and the committed buffer is already in the scene when our
+	 * handlers see it. It also leaves nothing to disconnect if creation fails. */
+	struct wlr_scene_tree *popup_scene_tree = wlr_scene_xdg_surface_create(parent_scene_tree, wlr_popup->base);
+	if (popup_scene_tree == NULL) {
+		wlr_log(WLR_ERROR, "Failed to allocate scene-graph node for XDG popup");
+		free(popup);
+		return;
+	}
+
 	popup->destroy.notify = popup_handle_destroy;
 	wl_signal_add(&wlr_popup->events.destroy, &popup->destroy);
 
@@ -398,13 +409,6 @@ handle_new_xdg_popup(struct wl_listener *listener, void *data)
 
 	popup->reposition.notify = popup_handle_reposition;
 	wl_signal_add(&wlr_popup->events.reposition, &popup->reposition);
-
-	struct wlr_scene_tree *popup_scene_tree = wlr_scene_xdg_surface_create(parent_scene_tree, wlr_popup->base);
-	if (popup_scene_tree == NULL) {
-		wlr_log(WLR_ERROR, "Failed to allocate scene-graph node for XDG popup");
-		free(popup);
-		return;
-	}
 
 	wlr_popup->base->data = popup_scene_tree;
 }
