@@ -36,6 +36,16 @@ struct cg_seat {
 
 	struct wlr_cursor *cursor;
 	struct wlr_xcursor_manager *xcursor_manager;
+
+	/* The current pointer image, kept to draw the pointer on the mirrored
+	 * outputs. wlr_cursor does not expose the image it was given. */
+	struct wlr_buffer *mirror_cursor_buffer;
+	int mirror_cursor_hotspot_x;
+	int mirror_cursor_hotspot_y;
+	/* Incremented whenever the image changes; never 0 once an image is set. */
+	uint32_t mirror_cursor_serial;
+	/* Wraps the default xcursor image; owned by the seat. */
+	struct wlr_buffer *xcursor_buffer;
 	struct wl_listener cursor_motion_relative;
 	struct wl_listener cursor_motion_absolute;
 	struct wl_listener cursor_button;
@@ -112,6 +122,7 @@ struct cg_drag_icon {
 };
 
 struct cg_seat *seat_create(struct cg_server *server, struct wlr_backend *backend);
+void seat_mirror_cursor_update(struct cg_seat *seat);
 void seat_destroy(struct cg_seat *seat);
 struct cg_view *seat_get_focus(struct cg_seat *seat);
 void seat_set_focus(struct cg_seat *seat, struct cg_view *view);

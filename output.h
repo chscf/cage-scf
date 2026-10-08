@@ -16,6 +16,13 @@ struct cg_output {
 	 * output is the primary one. */
 	struct wlr_scene_tree *mirror_tree;
 
+	/* The pointer as drawn on this output while it is not the primary one. */
+	struct wlr_output_cursor *mirror_cursor;
+	/* The image serial and output scale mirror_cursor was last set up for.
+	 * 0 means no image has been set. */
+	uint32_t mirror_cursor_serial;
+	float mirror_cursor_scale;
+
 	struct wl_listener commit;
 	struct wl_listener request_state;
 	struct wl_listener destroy;

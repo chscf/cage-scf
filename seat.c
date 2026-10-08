@@ -35,6 +35,9 @@
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/interfaces/wlr_keyboard.h>
 #include <xkbcommon/xkbcommon-names.h>
+#include <wlr/types/wlr_buffer.h>
+#include <wlr/interfaces/wlr_buffer.h>
+#include <drm_fourcc.h>
 #include <wlr/util/log.h>
 #if CAGE_HAS_XWAYLAND
 #include <wlr/xwayland.h>
@@ -51,6 +54,192 @@
 static void drag_icon_update_position(struct cg_drag_icon *drag_icon);
 static void keyboard_apply_numlock(struct wlr_keyboard *kb, bool on);
 static bool numlock_wanted(void);
+
+/* ----------------------------------------------------------------------------
+ * Mirrored pointer
+ *
+ * The pointer is confined to the primary output, and the other outputs show
+ * scaled copies of the scene, which does not include the cursor. Each other
+ * output therefore gets a wlr_output_cursor of its own, moved to the pointer's
+ * scaled position. The image itself is not scaled.
+ *
+ * wlr_cursor does not expose its current image, so the code that sets one
+ * also records it here.
+ * ------------------------------------------------------------------------- */
+
+/* A read-only wlr_buffer over pixel data it does not own, used to pass an
+ * xcursor image to wlr_output_cursor_set_buffer(). */
+struct cg_cursor_buffer {
+	struct wlr_buffer base;
+	void *data;
+	uint32_t format;
+	size_t stride;
+};
+
+static void
+cursor_buffer_destroy(struct wlr_buffer *wlr_buffer)
+{
+	struct cg_cursor_buffer *buffer = wl_container_of(wlr_buffer, buffer, base);
+	/* The pixel data is not owned by the buffer. */
+	free(buffer);
+}
+
+static bool
+cursor_buffer_begin_data_ptr_access(struct wlr_buffer *wlr_buffer, uint32_t flags, void **data, uint32_t *format,
+				    size_t *stride)
+{
+	struct cg_cursor_buffer *buffer = wl_container_of(wlr_buffer, buffer, base);
+
+	if (flags & WLR_BUFFER_DATA_PTR_ACCESS_WRITE) {
+		return false;
+	}
+
+	*data = buffer->data;
+	*format = buffer->format;
+	*stride = buffer->stride;
+	return true;
+}
+
+static void
+cursor_buffer_end_data_ptr_access(struct wlr_buffer *wlr_buffer)
+{
+}
+
+static const struct wlr_buffer_impl cursor_buffer_impl = {
+	.destroy = cursor_buffer_destroy,
+	.begin_data_ptr_access = cursor_buffer_begin_data_ptr_access,
+	.end_data_ptr_access = cursor_buffer_end_data_ptr_access,
+};
+
+static struct wlr_buffer *
+cursor_buffer_create(void *data, int width, int height)
+{
+	struct cg_cursor_buffer *buffer = calloc(1, sizeof(*buffer));
+
+	if (!buffer) {
+		return NULL;
+	}
+
+	wlr_buffer_init(&buffer->base, &cursor_buffer_impl, width, height);
+	buffer->data = data;
+	buffer->format = DRM_FORMAT_ARGB8888;
+	buffer->stride = (size_t) width * 4;
+
+	return &buffer->base;
+}
+
+/* Moves the pointer on every output except the primary to its scaled
+ * position, setting the image first if it has changed. */
+void
+seat_mirror_cursor_update(struct cg_seat *seat)
+{
+	struct cg_server *server = seat->server;
+	struct cg_output *primary = output_primary(server);
+	struct cg_output *output;
+	struct wlr_box primary_box;
+
+	view_primary_box(server, &primary_box);
+
+	if (primary_box.width <= 0 || primary_box.height <= 0) {
+		return;
+	}
+
+	wl_list_for_each (output, &server->outputs, link) {
+		struct wlr_box output_box;
+		double scale;
+		int dst_width, dst_height;
+
+		if (output == primary || !output->wlr_output->enabled) {
+			continue;
+		}
+
+		wlr_output_layout_get_box(server->output_layout, output->wlr_output, &output_box);
+		if (wlr_box_empty(&output_box)) {
+			continue;
+		}
+
+		if (!output->mirror_cursor) {
+			output->mirror_cursor = wlr_output_cursor_create(output->wlr_output);
+			if (!output->mirror_cursor) {
+				continue;
+			}
+			output->mirror_cursor_serial = 0;
+		}
+
+		scale = (double) output_box.width / primary_box.width;
+		if ((double) output_box.height / primary_box.height < scale) {
+			scale = (double) output_box.height / primary_box.height;
+		}
+
+		dst_width = (int) (primary_box.width * scale);
+		dst_height = (int) (primary_box.height * scale);
+
+		/* Setting the image creates a texture, so only do it when the image or the
+		 * output scale, which the hotspot and size are divided by, has changed. New
+		 * content drawn into the same client cursor buffer without a new set_cursor
+		 * request is therefore not picked up. */
+		if (output->mirror_cursor_serial != seat->mirror_cursor_serial ||
+		    output->mirror_cursor_scale != output->wlr_output->scale) {
+			wlr_output_cursor_set_buffer(output->mirror_cursor, seat->mirror_cursor_buffer,
+						     seat->mirror_cursor_hotspot_x, seat->mirror_cursor_hotspot_y);
+			output->mirror_cursor_serial = seat->mirror_cursor_serial;
+			output->mirror_cursor_scale = output->wlr_output->scale;
+		}
+
+		/* The primary is at the layout origin, so the pointer's layout position is
+		 * also its position within the mirrored image. */
+		wlr_output_cursor_move(output->mirror_cursor,
+				       (output_box.width - dst_width) / 2 + seat->cursor->x * scale,
+				       (output_box.height - dst_height) / 2 + seat->cursor->y * scale);
+	}
+}
+
+static void
+seat_mirror_cursor_set_image(struct cg_seat *seat, struct wlr_buffer *buffer, int hotspot_x, int hotspot_y)
+{
+	/* Keep a reference: the buffer is used again whenever an output needs the
+	 * image, and a client's cursor surface can go away at any time. */
+	if (buffer) {
+		wlr_buffer_lock(buffer);
+	}
+	if (seat->mirror_cursor_buffer) {
+		wlr_buffer_unlock(seat->mirror_cursor_buffer);
+	}
+
+	seat->mirror_cursor_buffer = buffer;
+	seat->mirror_cursor_hotspot_x = hotspot_x;
+	seat->mirror_cursor_hotspot_y = hotspot_y;
+
+	if (++seat->mirror_cursor_serial == 0) {
+		seat->mirror_cursor_serial = 1;
+	}
+
+	seat_mirror_cursor_update(seat);
+}
+
+/* Sets the default cursor. The xcursor image is wrapped once, and the wrapper
+ * is kept until the seat is destroyed. */
+static void
+seat_cursor_set_default(struct cg_seat *seat)
+{
+	wlr_cursor_set_xcursor(seat->cursor, seat->xcursor_manager, DEFAULT_XCURSOR);
+
+	if (!seat->xcursor_buffer) {
+		struct wlr_xcursor *xcursor =
+			wlr_xcursor_manager_get_xcursor(seat->xcursor_manager, DEFAULT_XCURSOR, 1);
+
+		if (xcursor && xcursor->image_count > 0) {
+			struct wlr_xcursor_image *image = xcursor->images[0];
+
+			seat->xcursor_buffer = cursor_buffer_create(image->buffer, image->width, image->height);
+			seat->mirror_cursor_hotspot_x = image->hotspot_x;
+			seat->mirror_cursor_hotspot_y = image->hotspot_y;
+		}
+	}
+
+	seat_mirror_cursor_set_image(seat, seat->xcursor_buffer, seat->mirror_cursor_hotspot_x,
+				     seat->mirror_cursor_hotspot_y);
+}
 
 /* XDG toplevels may have nested surfaces, such as popup windows for context
  * menus or tooltips. This function tests if any of those are underneath the
@@ -137,7 +326,7 @@ update_capabilities(struct cg_seat *seat)
 	if ((caps & WL_SEAT_CAPABILITY_POINTER) == 0) {
 		wlr_cursor_unset_image(seat->cursor);
 	} else {
-		wlr_cursor_set_xcursor(seat->cursor, seat->xcursor_manager, DEFAULT_XCURSOR);
+		seat_cursor_set_default(seat);
 	}
 }
 
@@ -712,6 +901,12 @@ handle_request_set_cursor(struct wl_listener *listener, void *data)
 	 * this one actually has pointer focus first. */
 	if (focused_client == event->seat_client->client) {
 		wlr_cursor_set_surface(seat->cursor, event->surface, event->hotspot_x, event->hotspot_y);
+
+		/* Use the client's cursor buffer for the mirrored pointer. */
+		seat_mirror_cursor_set_image(seat,
+					     event->surface && event->surface->buffer ? &event->surface->buffer->base
+										      : NULL,
+					     event->hotspot_x, event->hotspot_y);
 	}
 }
 
@@ -863,6 +1058,7 @@ process_cursor_motion(struct cg_seat *seat, uint32_t time_msec, double dx, doubl
 	}
 
 	wlr_idle_notifier_v1_notify_activity(seat->server->idle, seat->seat);
+	seat_mirror_cursor_update(seat);
 }
 
 static void
@@ -1025,10 +1221,36 @@ handle_destroy(struct wl_listener *listener, void *data)
 	}
 	wl_list_remove(&seat->new_input.link);
 
-	wlr_xcursor_manager_destroy(seat->xcursor_manager);
+	/* Destroy everything that uses the xcursor images before the xcursor manager
+	 * that owns their pixels, since a texture created from xcursor_buffer may keep
+	 * pointing at the pixel data. The outputs still exist at this point, so their
+	 * mirrored pointers are destroyed here. */
+	struct cg_output *output;
+	wl_list_for_each (output, &seat->server->outputs, link) {
+		if (output->mirror_cursor) {
+			wlr_output_cursor_destroy(output->mirror_cursor);
+			output->mirror_cursor = NULL;
+			output->mirror_cursor_serial = 0;
+		}
+	}
+	if (seat->mirror_cursor_buffer) {
+		wlr_buffer_unlock(seat->mirror_cursor_buffer);
+		seat->mirror_cursor_buffer = NULL;
+	}
+
 	if (seat->cursor) {
 		wlr_cursor_destroy(seat->cursor);
+		seat->cursor = NULL;
 	}
+
+	/* No texture references the wrapper any more; release it. */
+	if (seat->xcursor_buffer) {
+		wlr_buffer_drop(seat->xcursor_buffer);
+		seat->xcursor_buffer = NULL;
+	}
+
+	wlr_xcursor_manager_destroy(seat->xcursor_manager);
+	seat->xcursor_manager = NULL;
 
 	/* The outputs are destroyed after the seat, and the output code checks
 	 * server->seat before using it. */

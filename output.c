@@ -211,6 +211,7 @@ output_layout_arrange(struct cg_server *server)
 		};
 
 		wlr_cursor_map_to_region(server->seat->cursor, &confine);
+		seat_mirror_cursor_update(server->seat);
 
 		wlr_log(WLR_DEBUG, "mirror: pointer confined to %dx%d on %s", primary_width, primary_height,
 			primary->wlr_output->name);
