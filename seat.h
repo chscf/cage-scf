@@ -1,6 +1,7 @@
 #ifndef CG_SEAT_H
 #define CG_SEAT_H
 
+#include <sys/types.h>
 #include <wayland-server-core.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_data_device.h>
@@ -21,6 +22,10 @@ struct cg_seat {
 
 	struct wl_list keyboards;
 	struct wl_list keyboard_groups;
+
+	/* Polling of the keyboard layout file, see seat.c. */
+	struct wl_event_source *keymap_timer;
+	time_t keymap_mtime;
 	struct wl_list pointers;
 	struct wl_list touch;
 	struct wl_listener new_input;
@@ -57,6 +62,21 @@ struct cg_keyboard_group {
 	struct wl_listener modifiers;
 	struct wl_list link; // cg_seat::keyboard_groups
 	bool is_virtual;
+};
+
+/* A keyboard, tracked so that keymap changes can be applied to it directly.
+ *
+ * wlroots only propagates a keymap from a group member to the group, never
+ * from the group to its members, and the group takes on the modifier state its
+ * members report. Setting a keymap on the group alone leaves the members on
+ * the old keymap, reporting modifiers (such as the level 3 shift) that do not
+ * match the keymap clients were sent. */
+struct cg_keyboard {
+	struct wl_list link; // seat::keyboards
+	struct cg_seat *seat;
+	struct wlr_keyboard *keyboard;
+
+	struct wl_listener destroy;
 };
 
 struct cg_pointer {

@@ -11,6 +11,9 @@
 #include "config.h"
 
 #include <assert.h>
+#include <ctype.h>
+#include <stdio.h>
+#include <sys/stat.h>
 #include <linux/input-event-codes.h>
 #include <stdlib.h>
 #include <string.h>
@@ -204,6 +207,16 @@ handle_pointer_destroy(struct wl_listener *listener, void *data)
 }
 
 static void
+handle_keyboard_destroy(struct wl_listener *listener, void *data)
+{
+	struct cg_keyboard *keyboard = wl_container_of(listener, keyboard, destroy);
+
+	wl_list_remove(&keyboard->link);
+	wl_list_remove(&keyboard->destroy.link);
+	free(keyboard);
+}
+
+static void
 handle_new_pointer(struct cg_seat *seat, struct wlr_pointer *wlr_pointer)
 {
 	struct cg_pointer *pointer = calloc(1, sizeof(struct cg_pointer));
@@ -390,29 +403,131 @@ keyboard_group_destroy(struct cg_keyboard_group *keyboard_group)
 	free(keyboard_group);
 }
 
-static void
-handle_new_keyboard(struct cg_seat *seat, struct wlr_keyboard *keyboard, bool virtual)
+/* File the keyboard layout is read from.
+ *
+ * XKBLAYOUT_FILE holds an xkb layout name. It is read when a keyboard is added
+ * and polled every KEYMAP_POLL_MS, so writing it changes the layout at runtime.
+ * Polling is used instead of inotify because a watch on a file is lost when the
+ * file is replaced by a rename. */
+#define XKBLAYOUT_FILE "/etc/XKBLAYOUT"
+#define KEYMAP_POLL_MS 500
+
+/* Compiles a keymap for the layout named in XKBLAYOUT_FILE, or from the xkb
+ * defaults (the XKB_DEFAULT_* environment) if the file is missing or empty. */
+static struct xkb_keymap *
+keymap_from_layout_file(void)
 {
+	char layout[64] = {0};
+	FILE *file = fopen(XKBLAYOUT_FILE, "r");
+
+	if (file) {
+		if (fgets(layout, sizeof(layout), file) == NULL) {
+			layout[0] = 0;
+		}
+		fclose(file);
+	}
+
+	/* Strip the trailing newline and any other trailing whitespace. */
+	size_t len = strlen(layout);
+	while (len > 0 && isspace((unsigned char) layout[len - 1])) {
+		layout[--len] = 0;
+	}
+
+	struct xkb_rule_names names = {0};
+	if (len > 0) {
+		names.layout = layout;
+		/* On the German layout, CapsLock acts as a Shift lock. */
+		if (strcmp(layout, "de") == 0) {
+			names.options = "caps:shiftlock";
+		}
+	}
+
 	struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 	if (!context) {
 		wlr_log(WLR_ERROR, "Unable to create XKB context");
-		return;
+		return NULL;
 	}
 
-	struct xkb_keymap *keymap = xkb_keymap_new_from_names(context, NULL, XKB_KEYMAP_COMPILE_NO_FLAGS);
+	/* xkb copies the strings while compiling, so the local buffer is fine. */
+	struct xkb_keymap *keymap =
+		xkb_keymap_new_from_names(context, len > 0 ? &names : NULL, XKB_KEYMAP_COMPILE_NO_FLAGS);
 	if (!keymap) {
-		wlr_log(WLR_ERROR, "Unable to configure keyboard: keymap does not exist");
-		xkb_context_unref(context);
+		wlr_log(WLR_ERROR, "Unable to compile keymap for layout '%s'", len > 0 ? layout : "(default)");
+	} else {
+		wlr_log(WLR_INFO, "Keyboard layout: %s", len > 0 ? layout : "(default)");
+	}
+
+	xkb_context_unref(context);
+	return keymap;
+}
+
+/* Applies a keymap to every keyboard and keyboard group.
+ *
+ * The member keyboards need it as well as the groups: wlroots only propagates
+ * a keymap from members to their group, and the group takes its modifier state
+ * from the members, so a member left on the old keymap would report modifiers
+ * that do not match the new one. */
+static void
+seat_apply_keymap(struct cg_seat *seat, struct xkb_keymap *keymap)
+{
+	struct cg_keyboard_group *group;
+	struct cg_keyboard *keyboard;
+
+	wl_list_for_each (keyboard, &seat->keyboards, link) {
+		wlr_keyboard_set_keymap(keyboard->keyboard, keymap);
+	}
+
+	wl_list_for_each (group, &seat->keyboard_groups, link) {
+		wlr_keyboard_set_keymap(&group->wlr_group->keyboard, keymap);
+	}
+}
+
+static int
+handle_keymap_poll(void *data)
+{
+	struct cg_seat *seat = data;
+	struct stat st;
+
+	if (stat(XKBLAYOUT_FILE, &st) == 0 && st.st_mtime != seat->keymap_mtime) {
+		seat->keymap_mtime = st.st_mtime;
+
+		struct xkb_keymap *keymap = keymap_from_layout_file();
+		if (keymap) {
+			seat_apply_keymap(seat, keymap);
+			xkb_keymap_unref(keymap);
+		}
+	}
+
+	wl_event_source_timer_update(seat->keymap_timer, KEYMAP_POLL_MS);
+	return 0;
+}
+
+static void
+handle_new_keyboard(struct cg_seat *seat, struct wlr_keyboard *keyboard, bool virtual)
+{
+	/* Use the layout from the file, so that a keyboard added after a layout
+	 * change gets the current layout. */
+	struct xkb_keymap *keymap = keymap_from_layout_file();
+	if (!keymap) {
 		return;
 	}
 
 	wlr_keyboard_set_keymap(keyboard, keymap);
 
 	xkb_keymap_unref(keymap);
-	xkb_context_unref(context);
 	wlr_keyboard_set_repeat_info(keyboard, 25, 600);
 
 	cg_keyboard_group_add(keyboard, seat, virtual);
+
+	/* Track the keyboard so that seat_apply_keymap() can reach it. */
+	struct cg_keyboard *tracked = calloc(1, sizeof(struct cg_keyboard));
+	if (tracked) {
+		tracked->seat = seat;
+		tracked->keyboard = keyboard;
+		wl_list_insert(&seat->keyboards, &tracked->link);
+		tracked->destroy.notify = handle_keyboard_destroy;
+		wl_signal_add(&keyboard->base.events.destroy, &tracked->destroy);
+	}
 
 	wlr_seat_set_keyboard(seat->seat, keyboard);
 }
@@ -785,6 +900,13 @@ handle_destroy(struct wl_listener *listener, void *data)
 	wl_list_remove(&seat->request_set_selection.link);
 	wl_list_remove(&seat->request_set_primary_selection.link);
 
+	struct cg_keyboard *keyboard, *keyboard_tmp;
+	wl_list_for_each_safe (keyboard, keyboard_tmp, &seat->keyboards, link) {
+		wl_list_remove(&keyboard->destroy.link);
+		wl_list_remove(&keyboard->link);
+		free(keyboard);
+	}
+
 	struct cg_keyboard_group *group, *group_tmp;
 	wl_list_for_each_safe (group, group_tmp, &seat->keyboard_groups, link) {
 		wlr_keyboard_group_destroy(group->wlr_group);
@@ -882,6 +1004,14 @@ seat_create(struct cg_server *server, struct wlr_backend *backend)
 
 	wl_list_init(&seat->keyboards);
 	wl_list_init(&seat->keyboard_groups);
+
+	seat->keymap_timer =
+		wl_event_loop_add_timer(wl_display_get_event_loop(server->wl_display), handle_keymap_poll, seat);
+	if (seat->keymap_timer) {
+		wl_event_source_timer_update(seat->keymap_timer, KEYMAP_POLL_MS);
+	} else {
+		wlr_log(WLR_ERROR, "Could not start keymap watch; layout changes will not take effect");
+	}
 	wl_list_init(&seat->pointers);
 	wl_list_init(&seat->touch);
 
@@ -905,6 +1035,11 @@ seat_destroy(struct cg_seat *seat)
 {
 	if (!seat) {
 		return;
+	}
+
+	if (seat->keymap_timer) {
+		wl_event_source_remove(seat->keymap_timer);
+		seat->keymap_timer = NULL;
 	}
 
 	wl_list_remove(&seat->request_start_drag.link);
