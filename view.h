@@ -27,6 +27,9 @@ struct cg_view {
 	struct wlr_surface *wlr_surface;
 	struct wlr_scene_tree *scene_tree;
 
+	/* Rebuilds the mirrored copies whenever the surface commits. */
+	struct wl_listener surface_commit;
+
 	/* The view has a position in layout coordinates. */
 	int lx, ly;
 
@@ -53,6 +56,8 @@ char *view_get_title(struct cg_view *view);
 bool view_is_primary(struct cg_view *view);
 bool view_is_transient_for(struct cg_view *child, struct cg_view *parent);
 void view_activate(struct cg_view *view, bool activate);
+void view_primary_box(struct cg_server *server, struct wlr_box *box);
+void view_mirrors_rebuild(struct cg_server *server);
 void view_position(struct cg_view *view);
 void view_position_all(struct cg_server *server);
 void view_unmap(struct cg_view *view);

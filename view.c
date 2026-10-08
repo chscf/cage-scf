@@ -90,11 +90,173 @@ view_center(struct cg_view *view, struct wlr_box *layout_box)
 	}
 }
 
+/* The box views are laid out in: the primary output's size, at the layout
+ * origin. The other outputs show scaled copies, see view_mirrors_rebuild().
+ * Falls back to the whole layout when there is no usable primary output. */
+void
+view_primary_box(struct cg_server *server, struct wlr_box *box)
+{
+	struct cg_output *output = output_primary(server);
+
+	if (output) {
+		wlr_output_layout_get_box(server->output_layout, output->wlr_output, box);
+
+		if (!wlr_box_empty(box)) {
+			/* The view lives at the layout origin of the primary output. */
+			box->x = 0;
+			box->y = 0;
+			return;
+		}
+	}
+
+	wlr_output_layout_get_box(server->output_layout, NULL, box);
+	wlr_log(WLR_DEBUG, "mirror: no primary output, fell back to layout box");
+}
+
+/* Removes all copies from an output's mirror tree. Copies are rebuilt from
+ * scratch rather than updated, as wlr_scene has no signals for node changes. */
+static void
+output_mirror_clear(struct cg_output *output)
+{
+	struct wlr_scene_node *node, *tmp;
+
+	if (!output->mirror_tree) {
+		return;
+	}
+
+	wl_list_for_each_safe (node, tmp, &output->mirror_tree->children, link) {
+		wlr_scene_node_destroy(node);
+	}
+}
+
+/* Copies a scene node and its whole subtree into an output's mirror tree.
+ *
+ * The whole subtree is walked so that popups and subsurfaces, which have scene
+ * trees of their own below the view's, are copied as well. x and y accumulate
+ * the node's offset from the view in unscaled coordinates; each copy is placed
+ * at that offset times scale, plus the offset that centres the image. */
+static void
+view_mirror_copy_node(struct wlr_scene_tree *dst, struct wlr_scene_node *node, int x, int y, double scale,
+		      int off_x, int off_y)
+{
+	if (!node->enabled) {
+		return;
+	}
+
+	x += node->x;
+	y += node->y;
+
+	switch (node->type) {
+	case WLR_SCENE_NODE_BUFFER: {
+		struct wlr_scene_buffer *src = wlr_scene_buffer_from_node(node);
+		struct wlr_scene_buffer *copy;
+		int width, height;
+
+		if (!src->buffer) {
+			return;
+		}
+
+		copy = wlr_scene_buffer_create(dst, src->buffer);
+		if (!copy) {
+			return;
+		}
+
+		/* dst_width of 0 means "use the buffer's own size". */
+		width = src->dst_width > 0 ? src->dst_width : src->buffer->width;
+		height = src->dst_height > 0 ? src->dst_height : src->buffer->height;
+
+		wlr_scene_buffer_set_transform(copy, src->transform);
+		wlr_scene_buffer_set_dest_size(copy, (int) (width * scale), (int) (height * scale));
+		wlr_scene_node_set_position(&copy->node, off_x + (int) (x * scale), off_y + (int) (y * scale));
+		break;
+	}
+	case WLR_SCENE_NODE_TREE: {
+		struct wlr_scene_tree *tree = wl_container_of(node, tree, node);
+		struct wlr_scene_node *child;
+
+		wl_list_for_each (child, &tree->children, link) {
+			view_mirror_copy_node(dst, child, x, y, scale, off_x, off_y);
+		}
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+static void
+handle_view_surface_commit(struct wl_listener *listener, void *data)
+{
+	struct cg_view *view = wl_container_of(listener, view, surface_commit);
+	view_mirrors_rebuild(view->server);
+}
+
+/* Rebuilds the copies of all views on every output except the primary.
+ *
+ * Called whenever what is shown may have changed: a surface or popup commit,
+ * a popup going away, a view being mapped or unmapped, or the outputs changing. */
+void
+view_mirrors_rebuild(struct cg_server *server)
+{
+	struct cg_output *primary = output_primary(server);
+	struct cg_output *output;
+
+	wl_list_for_each (output, &server->outputs, link) {
+		struct wlr_box output_box;
+		struct cg_view *view;
+		double scale;
+		int src_width = 0, src_height = 0;
+		int dst_width, dst_height;
+
+		if (output == primary || !output->wlr_output->enabled || !output->mirror_tree) {
+			continue;
+		}
+
+		output_mirror_clear(output);
+
+		wlr_output_layout_get_box(server->output_layout, output->wlr_output, &output_box);
+		if (wlr_box_empty(&output_box)) {
+			continue;
+		}
+
+		/* One scale per output, based on the primary's size, so that all copies on
+		 * that output stay aligned with each other. */
+		{
+			struct wlr_box primary_box;
+
+			view_primary_box(server, &primary_box);
+			src_width = primary_box.width;
+			src_height = primary_box.height;
+		}
+
+		if (src_width <= 0 || src_height <= 0) {
+			continue;
+		}
+
+		scale = (double) output_box.width / src_width;
+		if ((double) output_box.height / src_height < scale) {
+			scale = (double) output_box.height / src_height;
+		}
+
+		dst_width = (int) (src_width * scale);
+		dst_height = (int) (src_height * scale);
+
+		wl_list_for_each (view, &server->views, link) {
+			if (!view->scene_tree) {
+				continue;
+			}
+
+			view_mirror_copy_node(output->mirror_tree, &view->scene_tree->node, 0, 0, scale,
+					      (output_box.width - dst_width) / 2, (output_box.height - dst_height) / 2);
+		}
+	}
+}
+
 void
 view_position(struct cg_view *view)
 {
 	struct wlr_box layout_box;
-	wlr_output_layout_get_box(view->server->output_layout, NULL, &layout_box);
+	view_primary_box(view->server, &layout_box);
 
 	if (view_is_primary(view) || view_extends_output_layout(view, &layout_box)) {
 		view_maximize(view, &layout_box);
@@ -122,7 +284,11 @@ view_unmap(struct cg_view *view)
 	wlr_foreign_toplevel_handle_v1_destroy(view->foreign_toplevel_handle);
 	view->foreign_toplevel_handle = NULL;
 
+	wl_list_remove(&view->surface_commit.link);
+
 	wlr_scene_node_destroy(&view->scene_tree->node);
+	view->scene_tree = NULL;
+	view_mirrors_rebuild(view->server);
 
 	view->wlr_surface->data = NULL;
 	view->wlr_surface = NULL;
@@ -155,6 +321,9 @@ view_map(struct cg_view *view, struct wlr_surface *surface)
 	view->wlr_surface = surface;
 	surface->data = view;
 
+	view->surface_commit.notify = handle_view_surface_commit;
+	wl_signal_add(&surface->events.commit, &view->surface_commit);
+
 #if CAGE_HAS_XWAYLAND
 	/* We shouldn't position override-redirect windows. They set
 	   their own (x,y) coordinates in handle_wayland_surface_map. */
@@ -165,6 +334,8 @@ view_map(struct cg_view *view, struct wlr_surface *surface)
 	}
 
 	wl_list_insert(&view->server->views, &view->link);
+
+	view_mirrors_rebuild(view->server);
 
 	view->foreign_toplevel_handle = wlr_foreign_toplevel_handle_v1_create(view->server->foreign_toplevel_manager);
 	if (!view->foreign_toplevel_handle)

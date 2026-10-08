@@ -1221,8 +1221,17 @@ seat_set_focus(struct cg_seat *seat, struct cg_view *view)
 void
 seat_center_cursor(struct cg_seat *seat)
 {
-	/* Place the cursor in the center of the output layout. */
-	struct wlr_box layout_box;
-	wlr_output_layout_get_box(seat->server->output_layout, NULL, &layout_box);
-	wlr_cursor_warp(seat->cursor, NULL, layout_box.width / 2, layout_box.height / 2);
+	/* Warp to the centre of the primary output rather than of the layout. The
+	 * layout spans all outputs, so its centre can lie outside the region the
+	 * pointer is confined to, in which case wlr_cursor_warp() does nothing. The
+	 * layout box is used until an output has been laid out. */
+	struct wlr_box box;
+
+	view_primary_box(seat->server, &box);
+
+	if (wlr_box_empty(&box)) {
+		wlr_output_layout_get_box(seat->server->output_layout, NULL, &box);
+	}
+
+	wlr_cursor_warp(seat->cursor, NULL, box.x + box.width / 2, box.y + box.height / 2);
 }

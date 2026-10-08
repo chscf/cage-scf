@@ -13,6 +13,7 @@
 
 #include <assert.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
@@ -41,6 +42,15 @@
 #if CAGE_HAS_XWAYLAND
 #include "xwayland.h"
 #endif
+
+/* Space left between outputs in the layout.
+ *
+ * wlr_cursor shows the pointer on every output in the layout, at the pointer's
+ * position relative to that output. With the pointer confined to the primary
+ * output and the outputs placed edge to edge, a pointer at the primary's right
+ * edge would partly show at the left edge of the next output. A gap wider than
+ * any cursor image keeps it off the other outputs. */
+#define MIRROR_OUTPUT_GAP 512
 
 #define OUTPUT_CONFIG_UPDATED                                                                                          \
 	(WLR_OUTPUT_STATE_ENABLED | WLR_OUTPUT_STATE_MODE | WLR_OUTPUT_STATE_SCALE | WLR_OUTPUT_STATE_TRANSFORM |      \
@@ -90,6 +100,126 @@ output_layout_add(struct cg_output *output, int32_t x, int32_t y)
 	wlr_scene_output_layout_add_output(output->server->scene_output_layout, layout_output, output->scene_output);
 }
 
+/* Returns the output views are laid out on: the first built-in panel (eDP,
+ * LVDS or DSI connector), otherwise the largest enabled output. The other
+ * outputs show scaled copies of it. */
+struct cg_output *
+output_primary(struct cg_server *server)
+{
+	struct cg_output *output, *internal = NULL, *largest = NULL;
+	int largest_area = 0;
+
+	wl_list_for_each (output, &server->outputs, link) {
+		int width, height, area;
+		const char *name = output->wlr_output->name;
+
+		if (!output->wlr_output->enabled) {
+			continue;
+		}
+
+		wlr_output_effective_resolution(output->wlr_output, &width, &height);
+		if (width <= 0 || height <= 0) {
+			continue;
+		}
+
+		/* Connectors used for built-in panels. */
+		if (!internal &&
+		    (strncmp(name, "eDP-", 4) == 0 || strncmp(name, "LVDS-", 5) == 0 ||
+		     strncmp(name, "DSI-", 4) == 0)) {
+			internal = output;
+		}
+
+		area = width * height;
+		if (area > largest_area) {
+			largest_area = area;
+			largest = output;
+		}
+	}
+
+	return internal ? internal : largest;
+}
+
+/* Places the primary output at the layout origin and the others to its right,
+ * MIRROR_OUTPUT_GAP apart, rebuilds the copies shown on the other outputs and
+ * confines the pointer to the primary output.
+ *
+ * Each output gets a region of its own so that the primary can show the real
+ * surfaces while the others show scaled copies. The other outputs are not
+ * interactive. */
+static void
+output_layout_arrange(struct cg_server *server)
+{
+	struct cg_output *primary = output_primary(server);
+	struct cg_output *output;
+	int primary_width = 0, primary_height = 0;
+	int x = 0;
+
+	if (primary) {
+		int width, height;
+
+		wlr_output_effective_resolution(primary->wlr_output, &width, &height);
+		primary_width = width;
+		primary_height = height;
+		output_layout_add(primary, 0, 0);
+
+		/* The primary output's mirror tree stays empty; keep it at the origin. */
+		if (primary->mirror_tree) {
+			wlr_scene_node_set_position(&primary->mirror_tree->node, 0, 0);
+		}
+
+		x = width + MIRROR_OUTPUT_GAP;
+	}
+
+	wl_list_for_each (output, &server->outputs, link) {
+		int width, height;
+
+		if (output == primary || !output->wlr_output->enabled) {
+			continue;
+		}
+
+		wlr_output_effective_resolution(output->wlr_output, &width, &height);
+		if (width <= 0 || height <= 0) {
+			continue;
+		}
+
+		output_layout_add(output, x, 0);
+
+		/* Copies are positioned relative to the tree, so put the tree at the
+		 * output's layout position. */
+		if (output->mirror_tree) {
+			wlr_scene_node_set_position(&output->mirror_tree->node, x, 0);
+		}
+
+		wlr_log(WLR_DEBUG, "mirror: output %s at (%d,0) %dx%d", output->wlr_output->name, x, width, height);
+
+		x += width + MIRROR_OUTPUT_GAP;
+	}
+
+	view_mirrors_rebuild(server);
+
+	/* Confine the pointer to the primary output, where the real surfaces are.
+	 * An explicit region is used rather than wlr_cursor_map_to_output(), which
+	 * looks up the output's box on every motion and falls back to the whole
+	 * layout whenever that box is empty, as it is while the layout is being
+	 * updated. The primary is at the layout origin, so the region is its size. */
+	if (primary && primary_width > 0 && primary_height > 0 && server->seat && server->seat->cursor) {
+		struct wlr_box confine = {
+			.x = 0,
+			.y = 0,
+			.width = primary_width,
+			.height = primary_height,
+		};
+
+		wlr_cursor_map_to_region(server->seat->cursor, &confine);
+
+		wlr_log(WLR_DEBUG, "mirror: pointer confined to %dx%d on %s", primary_width, primary_height,
+			primary->wlr_output->name);
+	}
+
+	wlr_log(WLR_DEBUG, "mirror: primary is %s",
+		primary ? primary->wlr_output->name : "(none)");
+}
+
 static inline void
 output_layout_remove(struct cg_output *output)
 {
@@ -110,7 +240,9 @@ output_enable(struct cg_output *output)
 	wlr_output_state_set_enabled(&state, true);
 
 	if (wlr_output_commit_state(wlr_output, &state)) {
-		output_layout_add_auto(output);
+		/* Any output change can change the primary output, so lay out all outputs
+		 * again. */
+		output_layout_arrange(output->server);
 	}
 
 	update_output_manager_config(output->server);
@@ -211,6 +343,13 @@ output_destroy(struct cg_output *output)
 	wl_list_remove(&output->frame.link);
 	wl_list_remove(&output->link);
 
+	if (output->mirror_tree) {
+		/* The mirror tree is a child of the scene's root rather than of the output,
+		 * so it has to be destroyed explicitly. */
+		wlr_scene_node_destroy(&output->mirror_tree->node);
+		output->mirror_tree = NULL;
+	}
+
 	/* During shutdown the output layout has already been freed, see
 	 * cg_server::display_gone. */
 	if (server->display_gone) {
@@ -219,6 +358,7 @@ output_destroy(struct cg_output *output)
 	}
 
 	output_layout_remove(output);
+	output_layout_arrange(server);
 
 	free(output);
 
@@ -286,6 +426,14 @@ handle_new_output(struct wl_listener *listener, void *data)
 		return;
 	}
 
+	/* Created for every output: which output is the primary can change as
+	 * outputs come and go, and the tree stays empty while this one is it. */
+	output->mirror_tree = wlr_scene_tree_create(&server->scene->tree);
+	if (!output->mirror_tree) {
+		wlr_log(WLR_ERROR, "Failed to allocate mirror tree");
+		return;
+	}
+
 	struct wlr_output_state state = {0};
 	wlr_output_state_set_enabled(&state, true);
 	if (!wl_list_empty(&wlr_output->modes)) {
@@ -320,7 +468,8 @@ handle_new_output(struct wl_listener *listener, void *data)
 
 	wlr_log(WLR_DEBUG, "Enabling new output %s", wlr_output->name);
 	if (wlr_output_commit_state(wlr_output, &state)) {
-		output_layout_add_auto(output);
+		/* Lay out all outputs again, see output_enable(). */
+		output_layout_arrange(output->server);
 	}
 
 	view_position_all(output->server);

@@ -207,8 +207,11 @@ set_fullscreen(struct cg_xdg_shell_view *xdg_shell_view, bool fullscreen)
 	 * Certain clients do not like figuring out their own window geometry if they
 	 * display in fullscreen mode, so we set it here.
 	 */
+	/* Use the primary output's size: the layout spans all outputs, and the
+	 * others show scaled copies of the primary. */
 	struct wlr_box layout_box;
-	wlr_output_layout_get_box(xdg_shell_view->view.server->output_layout, NULL, &layout_box);
+	view_primary_box(xdg_shell_view->view.server, &layout_box);
+	wlr_log(WLR_DEBUG, "mirror: fullscreen configure %dx%d", layout_box.width, layout_box.height);
 	wlr_xdg_toplevel_set_size(xdg_shell_view->xdg_toplevel, layout_box.width, layout_box.height);
 	wlr_xdg_toplevel_set_fullscreen(xdg_shell_view->xdg_toplevel, fullscreen);
 }
@@ -337,19 +340,32 @@ static void
 popup_handle_destroy(struct wl_listener *listener, void *data)
 {
 	struct cg_xdg_popup *popup = wl_container_of(listener, popup, destroy);
+	struct cg_view *view = popup_get_view(popup->xdg_popup);
 	wl_list_remove(&popup->destroy.link);
 	wl_list_remove(&popup->commit.link);
 	wl_list_remove(&popup->reposition.link);
 	free(popup);
+	/* Remove the popup's copies from the other outputs. */
+	if (view) {
+		view_mirrors_rebuild(view->server);
+	}
 }
 
 static void
 popup_handle_commit(struct wl_listener *listener, void *data)
 {
 	struct cg_xdg_popup *popup = wl_container_of(listener, popup, commit);
+	struct cg_view *view;
 
 	if (popup->xdg_popup->base->initial_commit) {
 		popup_unconstrain(popup->xdg_popup);
+	}
+
+	/* A popup's commits are not seen by its view, so rebuild the copies on the
+	 * other outputs here as well. */
+	view = popup_get_view(popup->xdg_popup);
+	if (view) {
+		view_mirrors_rebuild(view->server);
 	}
 }
 
