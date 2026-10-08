@@ -211,6 +211,13 @@ output_destroy(struct cg_output *output)
 	wl_list_remove(&output->frame.link);
 	wl_list_remove(&output->link);
 
+	/* During shutdown the output layout has already been freed, see
+	 * cg_server::display_gone. */
+	if (server->display_gone) {
+		free(output);
+		return;
+	}
+
 	output_layout_remove(output);
 
 	free(output);

@@ -74,6 +74,10 @@ struct cg_server {
 	bool allow_vt_switch;
 	bool return_app_code;
 	bool terminated;
+	/* Set once wl_display_destroy() has been called. The output layout is freed
+	 * by the display's destroy signal, before the backend destroys the outputs,
+	 * so output_destroy() must not use the layout once this is set. */
+	bool display_gone;
 	enum wlr_log_importance log_level;
 };
 

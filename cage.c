@@ -667,6 +667,7 @@ end:
 	seat_destroy(server.seat);
 	/* This function is not null-safe, but we only ever get here
 	   with a proper wl_display. */
+	server.display_gone = true;
 	wl_display_destroy(server.wl_display);
 	if (server.scene != NULL) {
 		wlr_scene_node_destroy(&server.scene->tree.node);
