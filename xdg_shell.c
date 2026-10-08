@@ -174,7 +174,16 @@ maximize(struct cg_view *view, int output_width, int output_height)
 {
 	struct cg_xdg_shell_view *xdg_shell_view = xdg_shell_view_from_view(view);
 	wlr_xdg_toplevel_set_size(xdg_shell_view->xdg_toplevel, output_width, output_height);
-	wlr_xdg_toplevel_set_maximized(xdg_shell_view->xdg_toplevel, true);
+
+	/* view_position_all() resizes views through here when the outputs change.
+	 * A fullscreen client ignores a maximized configure and would keep its old
+	 * size, so send fullscreen again instead. */
+	if (xdg_shell_view->xdg_toplevel->current.fullscreen) {
+		wlr_log(WLR_DEBUG, "mirror: re-asserting fullscreen at %dx%d", output_width, output_height);
+		wlr_xdg_toplevel_set_fullscreen(xdg_shell_view->xdg_toplevel, true);
+	} else {
+		wlr_xdg_toplevel_set_maximized(xdg_shell_view->xdg_toplevel, true);
+	}
 }
 
 static void
