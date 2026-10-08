@@ -33,6 +33,8 @@
 #include <wlr/types/wlr_virtual_keyboard_v1.h>
 #include <wlr/types/wlr_virtual_pointer_v1.h>
 #include <wlr/types/wlr_xcursor_manager.h>
+#include <wlr/interfaces/wlr_keyboard.h>
+#include <xkbcommon/xkbcommon-names.h>
 #include <wlr/util/log.h>
 #if CAGE_HAS_XWAYLAND
 #include <wlr/xwayland.h>
@@ -47,6 +49,8 @@
 #endif
 
 static void drag_icon_update_position(struct cg_drag_icon *drag_icon);
+static void keyboard_apply_numlock(struct wlr_keyboard *kb, bool on);
+static bool numlock_wanted(void);
 
 /* XDG toplevels may have nested surfaces, such as popup windows for context
  * menus or tooltips. This function tests if any of those are underneath the
@@ -300,6 +304,15 @@ handle_key_event(struct wlr_keyboard *keyboard, struct cg_seat *seat, void *data
 	const xkb_keysym_t *syms;
 	int nsyms = xkb_state_key_get_syms(keyboard->xkb_state, keycode, &syms);
 
+	/* Once the user toggles NumLock, stop re-applying the configured state. */
+	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+		for (int i = 0; i < nsyms; i++) {
+			if (syms[i] == XKB_KEY_Num_Lock) {
+				seat->numlock_user_owned = true;
+			}
+		}
+	}
+
 	bool handled = false;
 	uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard);
 	if ((modifiers & WLR_MODIFIER_ALT) && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
@@ -331,6 +344,15 @@ static void
 handle_keyboard_group_modifiers(struct wl_listener *listener, void *data)
 {
 	struct cg_keyboard_group *group = wl_container_of(listener, group, modifiers);
+
+	/* The group takes on the modifier state of the member that last reported one,
+	 * which drops a NumLock lock set on the group. Re-apply it unless the user has
+	 * toggled NumLock. This re-enters once; the lock is then already set, so no
+	 * further event is emitted. */
+	if (!group->seat->numlock_user_owned) {
+		keyboard_apply_numlock(&group->wlr_group->keyboard, numlock_wanted());
+	}
+
 	handle_modifier_event(&group->wlr_group->keyboard, group->seat);
 }
 
@@ -370,6 +392,8 @@ cg_keyboard_group_add(struct wlr_keyboard *keyboard, struct cg_seat *seat, bool 
 
 	cg_group->wlr_group->data = cg_group;
 	wlr_keyboard_set_keymap(&cg_group->wlr_group->keyboard, keyboard->keymap);
+	/* Apply the configured NumLock state to the new group. */
+	keyboard_apply_numlock(&cg_group->wlr_group->keyboard, numlock_wanted());
 
 	wlr_keyboard_set_repeat_info(&cg_group->wlr_group->keyboard, keyboard->repeat_info.rate,
 				     keyboard->repeat_info.delay);
@@ -403,14 +427,65 @@ keyboard_group_destroy(struct cg_keyboard_group *keyboard_group)
 	free(keyboard_group);
 }
 
-/* File the keyboard layout is read from.
+/* Files the keyboard layout and the NumLock state are read from.
  *
- * XKBLAYOUT_FILE holds an xkb layout name. It is read when a keyboard is added
- * and polled every KEYMAP_POLL_MS, so writing it changes the layout at runtime.
- * Polling is used instead of inotify because a watch on a file is lost when the
- * file is replaced by a rename. */
+ * XKBLAYOUT_FILE holds an xkb layout name and XKBNUMLOCK_FILE holds "1" to
+ * lock NumLock. Both are read when a keyboard is added and polled every
+ * KEYMAP_POLL_MS, so writing them changes the layout or the NumLock state at
+ * runtime. Polling is used instead of inotify because a watch on a file is
+ * lost when the file is replaced by a rename. */
 #define XKBLAYOUT_FILE "/etc/XKBLAYOUT"
+#define XKBNUMLOCK_FILE "/etc/XKBNUMLOCK"
 #define KEYMAP_POLL_MS 500
+
+/* Returns whether XKBNUMLOCK_FILE asks for NumLock to be on. A missing or
+ * unreadable file means off. */
+static bool
+numlock_wanted(void)
+{
+	char buf[16] = {0};
+	FILE *file = fopen(XKBNUMLOCK_FILE, "r");
+
+	if (!file) {
+		return false;
+	}
+	if (fgets(buf, sizeof(buf), file) == NULL) {
+		buf[0] = 0;
+	}
+	fclose(file);
+
+	return buf[0] == '1';
+}
+
+/* Locks or unlocks NumLock on a keyboard, leaving all other modifier state
+ * unchanged. This also updates the keyboard's LEDs. */
+static void
+keyboard_apply_numlock(struct wlr_keyboard *kb, bool on)
+{
+	xkb_mod_index_t idx;
+	xkb_mod_mask_t locked;
+
+	if (!kb->keymap || !kb->xkb_state) {
+		return;
+	}
+
+	idx = xkb_keymap_mod_get_index(kb->keymap, XKB_MOD_NAME_NUM);
+	if (idx == XKB_MOD_INVALID) {
+		wlr_log(WLR_INFO, "Keymap has no NumLock modifier, ignoring the setting");
+		return;
+	}
+
+	locked = xkb_state_serialize_mods(kb->xkb_state, XKB_STATE_MODS_LOCKED);
+	if (on) {
+		locked |= (xkb_mod_mask_t) 1 << idx;
+	} else {
+		locked &= ~((xkb_mod_mask_t) 1 << idx);
+	}
+
+	wlr_keyboard_notify_modifiers(kb, xkb_state_serialize_mods(kb->xkb_state, XKB_STATE_MODS_DEPRESSED),
+				      xkb_state_serialize_mods(kb->xkb_state, XKB_STATE_MODS_LATCHED), locked,
+				      xkb_state_serialize_layout(kb->xkb_state, XKB_STATE_LAYOUT_EFFECTIVE));
+}
 
 /* Compiles a keymap for the layout named in XKBLAYOUT_FILE, or from the xkb
  * defaults (the XKB_DEFAULT_* environment) if the file is missing or empty. */
@@ -472,6 +547,7 @@ seat_apply_keymap(struct cg_seat *seat, struct xkb_keymap *keymap)
 {
 	struct cg_keyboard_group *group;
 	struct cg_keyboard *keyboard;
+	bool numlock = numlock_wanted();
 
 	wl_list_for_each (keyboard, &seat->keyboards, link) {
 		wlr_keyboard_set_keymap(keyboard->keyboard, keymap);
@@ -479,6 +555,16 @@ seat_apply_keymap(struct cg_seat *seat, struct xkb_keymap *keymap)
 
 	wl_list_for_each (group, &seat->keyboard_groups, link) {
 		wlr_keyboard_set_keymap(&group->wlr_group->keyboard, keymap);
+	}
+
+	/* Re-apply NumLock last: setting a keymap resets the modifier state, and the
+	 * members' keymaps propagate to the group after it was set above. */
+	wl_list_for_each (keyboard, &seat->keyboards, link) {
+		keyboard_apply_numlock(keyboard->keyboard, numlock);
+	}
+
+	wl_list_for_each (group, &seat->keyboard_groups, link) {
+		keyboard_apply_numlock(&group->wlr_group->keyboard, numlock);
 	}
 }
 
@@ -498,6 +584,20 @@ handle_keymap_poll(void *data)
 		}
 	}
 
+	/* A change to the file overrides a NumLock toggle made by the user. */
+	if (stat(XKBNUMLOCK_FILE, &st) == 0 && st.st_mtime != seat->numlock_mtime) {
+		struct cg_keyboard_group *group;
+		bool numlock = numlock_wanted();
+
+		seat->numlock_mtime = st.st_mtime;
+		seat->numlock_user_owned = false;
+
+		wl_list_for_each (group, &seat->keyboard_groups, link) {
+			keyboard_apply_numlock(&group->wlr_group->keyboard, numlock);
+		}
+		wlr_log(WLR_INFO, "NumLock: %s", numlock ? "on" : "off");
+	}
+
 	wl_event_source_timer_update(seat->keymap_timer, KEYMAP_POLL_MS);
 	return 0;
 }
@@ -513,6 +613,9 @@ handle_new_keyboard(struct cg_seat *seat, struct wlr_keyboard *keyboard, bool vi
 	}
 
 	wlr_keyboard_set_keymap(keyboard, keymap);
+	/* Set NumLock on the keyboard itself too, as the group takes its modifier
+	 * state from its members. */
+	keyboard_apply_numlock(keyboard, numlock_wanted());
 
 	xkb_keymap_unref(keymap);
 	wlr_keyboard_set_repeat_info(keyboard, 25, 600);

@@ -23,9 +23,13 @@ struct cg_seat {
 	struct wl_list keyboards;
 	struct wl_list keyboard_groups;
 
-	/* Polling of the keyboard layout file, see seat.c. */
+	/* Polling of the keyboard configuration files, see seat.c. */
 	struct wl_event_source *keymap_timer;
 	time_t keymap_mtime;
+	time_t numlock_mtime;
+	/* Set when the user toggles NumLock; from then on the configured NumLock
+	 * state is no longer re-applied. */
+	bool numlock_user_owned;
 	struct wl_list pointers;
 	struct wl_list touch;
 	struct wl_listener new_input;
