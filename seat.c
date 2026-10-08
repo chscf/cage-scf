@@ -804,6 +804,13 @@ handle_destroy(struct wl_listener *listener, void *data)
 	if (seat->cursor) {
 		wlr_cursor_destroy(seat->cursor);
 	}
+
+	/* The outputs are destroyed after the seat, and the output code checks
+	 * server->seat before using it. */
+	if (seat->server->seat == seat) {
+		seat->server->seat = NULL;
+	}
+
 	free(seat);
 }
 
